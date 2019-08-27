@@ -11,6 +11,8 @@ import sys
 import pymysql
 from dateutil import parser as dateparser
 from elasticsearch import Elasticsearch
+from kafka import KafkaProducer
+from kafka.errors import NoBrokersAvailable, KafkaError, KafkaTimeoutError
 from scrapy.exceptions import DropItem
 
 from NewsArticle import NewsArticle
@@ -655,3 +657,63 @@ class PandasStorage(ExtractedInformationStorage):
         )
         self.df.to_pickle(self.full_path)
         self.log.info("Wrote to Pandas to %s", self.full_path)
+
+
+class KafkaStorage(ExtractedInformationStorage):
+    """
+    Handles remote storage of the meta data in Kafka
+
+    Example of kafka settings:
+
+    [Kafka]
+    servers = "localhost:9092"
+    topic = "crawler-news"
+    client_id = "newsplease"
+    """
+
+    log = None
+    cfg = None
+    es = None
+    index_current = None
+    index_archive = None
+    mapping = None
+    running = False
+
+    def __init__(self):
+        self.log = logging.getLogger(__name__ + ".Kafka")
+        self.cfg = CrawlerConfig.get_instance()
+        # check connection to Database and set the configuration
+        self.database = self.cfg.section("Kafka")
+        self.topic = self.database["topic"]
+        try:
+            self.producer = KafkaProducer(
+                bootstrap_servers=self.database["servers"],
+                client_id=self.database["client_id"],
+                value_serializer=lambda v: json.dumps(v).encode("utf-8"),
+            )
+        except NoBrokersAvailable as error:
+            self.running = False
+            self.log.error(
+                "Failed to connect to Kafka, this module will be deactivated. "
+                "Please check if the database is running and the config is correct: %s"
+                % error
+            )
+        else:
+            self.running = True
+
+    def process_item(self, item, _spider):
+        if self.running:
+            try:
+                future = self.producer.send(
+                    self.topic, ExtractedInformationStorage.extract_relevant_info(item)
+                )
+                # Block for 'synchronous' sends
+                future.get(timeout=10)
+            except (KafkaError, KafkaTimeoutError) as error:
+                self.running = False
+                self.log.error(
+                    "Failed to connect to Kafka, this module will be deactivated. "
+                    "Please check if the kafka is running "
+                    "and the config is correct: %s" % error
+                )
+        return item
